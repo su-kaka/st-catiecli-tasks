@@ -30,6 +30,7 @@ import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 
 const MODULE_NAME = 'st-catiecli-tasks';
 const GENERATE_URL = '/api/backends/chat-completions/generate';
+const STATUS_URL = '/api/backends/chat-completions/status';
 const DEFAULT_UPSTREAM = 'https://catiecli.sukaka.top';
 
 // ===== 轮询节奏(代码内固定,非用户设置) =====
@@ -342,6 +343,15 @@ function shouldIntercept(generateData) {
     return interceptKeywordRegex().test(String(generateData.custom_url ?? ''));
 }
 
+/** 是否应拦截本次 status 请求(连接按钮的模型列表):Custom 源 + URL 命中关键词 */
+function shouldInterceptStatus(statusData) {
+    const s = getSettings();
+    if (!s.enabled) return false;
+    if (statusData?.chat_completion_source !== chat_completion_sources.CUSTOM) return false;
+    if (typeof statusData !== 'object' || !statusData.custom_url) return false;
+    return interceptKeywordRegex().test(String(statusData.custom_url));
+}
+
 /** 非流式:envelope → 伪 Response(failed 时 ok=false,ST 会弹错并透传错误体) */
 function envelopeToResponse(env, ctx) {
     const status = env.status === 'failed'
@@ -512,24 +522,77 @@ async function runTaskAsResponse(generateData, signal) {
     return streamTaskResponse(upstream, apiKey, taskId, signal, ctx);
 }
 
+// ===== 接管「连接」按钮的模型列表请求(POST /status) =====
+
+/** 浏览器直连 catiecli 拉取模型列表(带网络重试),返回 OpenAI 兼容 {data:[...]} */
+async function fetchUpstreamModels(upstream, apiKey) {
+    const data = await withNetRetry('模型列表', () => fetch(`${upstream}/v1/models`, {
+        headers: { 'Authorization': `Bearer ${apiKey}` },
+    }).then(async resp => {
+        const text = await resp.text();
+        if (!resp.ok) {
+            let message = `模型列表获取失败: HTTP ${resp.status}`;
+            try {
+                message = `模型列表获取失败: HTTP ${resp.status} ${extractUpstreamMessage(JSON.parse(text))}`.trimEnd();
+            } catch { /* 非 JSON 原样展示 */ }
+            throw taskApiError('获取模型列表', resp.status, message, text.slice(0, 2000) || null, { upstream });
+        }
+        return JSON.parse(text);
+    }));
+    if (!Array.isArray(data?.data)) {
+        throw taskApiError('获取模型列表', 502, '模型列表返回格式异常(缺少 data 数组)', JSON.stringify(data).slice(0, 2000), { upstream });
+    }
+    return data;
+}
+
+/** status 请求 → 伪 Response:浏览器直连 catiecli /v1/models。
+ *  失败时返回 ST 后端同款的 {error: true}(ST 界面显示 Invalid),并弹详情窗。 */
+async function runStatusAsResponse(statusData) {
+    const upstream = resolveUpstream(statusData);
+    let apiKey;
+    try {
+        apiKey = await resolveApiKey();
+    } catch (err) {
+        showTaskErrorPopup(err.isTaskApiError ? err : taskApiError('检查设置', err.statusCode ?? 401, err.message, null, { upstream }));
+        return new Response(JSON.stringify({ error: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    try {
+        const data = await fetchUpstreamModels(upstream, apiKey);
+        console.info(`[st-catiecli-tasks] 接管模型列表请求 → ${data.data.length} 个模型`);
+        return new Response(JSON.stringify({ object: 'list', data: data.data }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+        });
+    } catch (err) {
+        const taskErr = err.isTaskApiError ? err : taskApiError('获取模型列表', err.statusCode ?? 502, err.message ?? String(err), null, { upstream });
+        showTaskErrorPopup(taskErr);
+        // 与 ST 后端失败时的响应同构:{error: true} → 界面显示 Invalid
+        return new Response(JSON.stringify({ error: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+}
+
 function installFetchPatch() {
     if (patched) return;
     patched = true;
     window.fetch = async function (input, init) {
         const url = typeof input === 'string' ? input : input?.url ?? '';
-        if (url.includes(GENERATE_URL) && init?.method?.toUpperCase() === 'POST' && init?.body) {
-            let generateData = null;
+        if (init?.method?.toUpperCase() === 'POST' && init?.body) {
+            let bodyData = null;
             try {
-                generateData = JSON.parse(init.body);
+                bodyData = JSON.parse(init.body);
             } catch { /* 非 JSON 请求体,不接管 */ }
-            if (generateData && shouldIntercept(generateData)) {
-                console.info('[st-catiecli-tasks] 接管生成请求 →', generateData.model);
-                return await runTaskAsResponse(generateData, init.signal ?? null);
+            if (bodyData && url.includes(STATUS_URL) && shouldInterceptStatus(bodyData)) {
+                console.info('[st-catiecli-tasks] 接管模型列表请求(status)');
+                return await runStatusAsResponse(bodyData);
+            }
+            if (bodyData && url.includes(GENERATE_URL) && shouldIntercept(bodyData)) {
+                console.info('[st-catiecli-tasks] 接管生成请求 →', bodyData.model);
+                return await runTaskAsResponse(bodyData, init.signal ?? null);
             }
         }
         return originalFetch.call(this, input, init);
     };
-    console.info('[st-catiecli-tasks] fetch 拦截已安装(仅接管 Custom 源生成请求)');
+    console.info('[st-catiecli-tasks] fetch 拦截已安装(接管 Custom 源生成请求与模型列表请求)');
 }
 
 function uninstallFetchPatch() {
