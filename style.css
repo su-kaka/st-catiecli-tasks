@@ -38,3 +38,54 @@
     border-color: #4caf50 !important;
     box-shadow: none;
 }
+
+/* ===== 生成失败详情弹窗 ===== */
+.catiecli-error-popup .catiecli-error-title {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 1.1em;
+    font-weight: 600;
+    color: #e8574d;
+    line-height: 1.4;
+    word-break: break-word;
+}
+
+.catiecli-error-popup .catiecli-error-title i {
+    margin-top: 3px;
+    flex-shrink: 0;
+}
+
+.catiecli-error-popup .catiecli-error-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+    margin: 10px 0;
+    opacity: 0.8;
+    font-size: 0.9em;
+}
+
+.catiecli-error-popup .catiecli-error-detail {
+    margin-top: 6px;
+}
+
+.catiecli-error-popup .catiecli-error-detail-label {
+    opacity: 0.7;
+    font-size: 0.9em;
+    margin-bottom: 4px;
+}
+
+.catiecli-error-popup .catiecli-error-detail pre {
+    max-height: 300px;
+    overflow: auto;
+    margin: 0;
+    padding: 10px;
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    font-size: 0.85em;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+    user-select: text;
+}

@@ -26,6 +26,7 @@
 import { extension_settings, renderExtensionTemplateAsync } from '../../../extensions.js';
 import { saveSettings, saveSettingsDebounced } from '../../../../script.js';
 import { chat_completion_sources } from '../../../openai.js';
+import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 
 const MODULE_NAME = 'st-catiecli-tasks';
 const GENERATE_URL = '/api/backends/chat-completions/generate';
@@ -77,7 +78,12 @@ function resolveUpstream(generateData) {
 function resolveApiKey() {
     const key = getSettings().apiKey?.trim();
     if (key) return key;
-    throw new Error('未设置 API 密钥:请在 Catiecli Tasks 扩展面板填写 cat- 密钥并保存');
+    throw taskApiError(
+        '检查设置',
+        401,
+        '未设置 API 密钥:请在 Extensions(扩展)面板 → Catiecli Tasks 里填写 cat- 密钥并点击保存图标',
+        null,
+    );
 }
 
 // ===== 网络重试包装(连不上才重试;HTTP 错误是明确响应,直接抛) =====
@@ -93,6 +99,7 @@ async function withNetRetry(label, fn) {
         try {
             return await fn();
         } catch (err) {
+            if (err.isTaskApiError) throw err; // 已构造好的结构化错误:透传
             if (err instanceof Error && err.statusCode !== undefined) throw err; // HTTP 错误:透传
             if (!isNetworkError(err)) throw err;
             lastErr = err;
@@ -103,15 +110,133 @@ async function withNetRetry(label, fn) {
             }
         }
     }
-    throw Object.assign(
-        new Error(`${label}: 连续 ${NET_RETRY_MAX} 次无法连接上游(${lastErr?.message ?? '网络错误'})`),
-        { statusCode: 502 },
+    throw taskApiError(
+        label,
+        502,
+        `${label}失败: 连续 ${NET_RETRY_MAX} 次无法连接上游(${lastErr?.message ?? '网络错误'})。请检查网络或上游地址`,
+        lastErr?.stack ?? null,
     );
+}
+
+// ===== 错误展示(用户友好:完整详情弹窗,ST 原生 toast 照常保留) =====
+
+function escapeHtml(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
+
+/** 对象 → 缩进 JSON;字符串原样(供弹窗详情展示) */
+function prettyJson(v) {
+    if (v == null) return '';
+    if (typeof v === 'string') return v;
+    if (typeof v !== 'object') return String(v);
+    try { return JSON.stringify(v, null, 2); } catch { return String(v); }
+}
+
+/** 从上游错误体挖最可读的消息(标准 OpenAI / FastAPI detail / Gemini 形态) */
+function extractUpstreamMessage(result) {
+    if (result == null) return '';
+    if (typeof result === 'string') return result.trim();
+    const err = result.error ?? result.detail;
+    if (typeof err === 'string') return err;
+    if (typeof err?.message === 'string') return err.message;
+    if (typeof result?.message === 'string') return result.message;
+    if (typeof err?.status === 'string') return err.status;
+    return '';
+}
+
+/** 从 SSE 分片里提取 ST 能解析的 data: {...} 错误帧 */
+function extractStreamError(chunks) {
+    const text = (Array.isArray(chunks) ? chunks : []).join('');
+    for (const line of text.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const payload = trimmed.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        try {
+            const data = JSON.parse(payload);
+            const message = extractUpstreamMessage(data);
+            if (message) return { message, raw: prettyJson(data) };
+        } catch { /* 非 JSON 行,跳过 */ }
+    }
+    return null;
+}
+
+/** 构造任务 API 错误(带结构化信息,弹窗与错误 Response 共用) */
+function taskApiError(phase, statusCode, message, detail, ctx = {}) {
+    const err = new Error(message);
+    err.isTaskApiError = true;
+    err.phase = phase;
+    err.statusCode = statusCode ?? 502;
+    err.detail = detail ?? null;
+    err.taskId = ctx.taskId ?? '';
+    err.model = ctx.model ?? '';
+    err.upstream = ctx.upstream ?? '';
+    return err;
+}
+
+/** 任务 API 错误 → 伪 Response(ok=false):ST 走原生报错路径,不回退直连 */
+function taskErrorResponse(err) {
+    return new Response(JSON.stringify({ error: { message: err.message, code: err.statusCode } }), {
+        status: err.statusCode,
+        headers: { 'Content-Type': 'application/json' },
+    });
+}
+
+/** 同一时间只保留一个错误弹窗;期间的新错误降级为 toast */
+let taskErrorPopup = null;
+
+/** 生成失败详情弹窗:主消息 + 状态码 + 模型/任务/上游 + 完整上游错误体,可一键复制 */
+function showTaskErrorPopup(err) {
+    const code = err.statusCode ?? 502;
+    const mainMsg = err.message || '未知错误';
+    const detailText = prettyJson(err.detail).trim();
+    const detailHtml = detailText
+        ? `<div class="catiecli-error-detail"><div class="catiecli-error-detail-label">上游错误详情</div><pre>${escapeHtml(detailText.slice(0, 4000))}${detailText.length > 4000 ? '\n…(超出部分已截断)' : ''}</pre></div>`
+        : '';
+    const meta = [
+        `HTTP <b>${code}</b>`,
+        err.phase ? `阶段: ${escapeHtml(err.phase)}` : '',
+        err.model ? `模型: ${escapeHtml(err.model)}` : '',
+        err.taskId ? `任务: ${escapeHtml(err.taskId)}` : '',
+        err.upstream ? `上游: ${escapeHtml(err.upstream)}` : '',
+    ].filter(Boolean).map(x => `<span>${x}</span>`).join('');
+    const html = `<div class="catiecli-error-popup">
+        <div class="catiecli-error-title"><i class="fa-solid fa-circle-exclamation"></i>${escapeHtml(mainMsg)}</div>
+        <div class="catiecli-error-meta">${meta}</div>
+        ${detailHtml}
+    </div>`;
+    const plain = [
+        `[Catiecli Tasks] ${err.phase ? `生成失败(${err.phase})` : '生成失败'}: ${mainMsg}`,
+        `HTTP ${code}`,
+        err.model && `模型: ${err.model}`,
+        err.taskId && `任务: ${err.taskId}`,
+        err.upstream && `上游: ${err.upstream}`,
+        detailText,
+    ].filter(Boolean).join('\n');
+    console.error(`[st-catiecli-tasks] ${plain}`);
+    if (taskErrorPopup) {
+        toastr.error(mainMsg, 'Catiecli Tasks 生成失败', { timeOut: 10000, extendedTimeOut: 5000, preventDuplicates: true });
+        return;
+    }
+    taskErrorPopup = callGenericPopup(html, POPUP_TYPE.TEXT, '', {
+        okButton: '关闭',
+        customButtons: [{
+            text: '复制详情',
+            action: async () => {
+                try {
+                    await navigator.clipboard.writeText(plain);
+                    toastr.success('错误详情已复制到剪贴板', 'Catiecli Tasks', { timeOut: 3000 });
+                } catch {
+                    toastr.warning('复制失败,完整详情请查看浏览器控制台(F12)', 'Catiecli Tasks');
+                }
+            },
+        }],
+    }).catch(() => {}).finally(() => { taskErrorPopup = null; });
 }
 
 // ===== 任务 API 客户端 =====
 
-async function submitTask(upstream, apiKey, body) {
+async function submitTask(upstream, apiKey, body, ctx) {
     return withNetRetry('任务提交', () => fetch(`${upstream}/v1/openai/tasks`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
@@ -119,21 +244,31 @@ async function submitTask(upstream, apiKey, body) {
     }).then(async resp => {
         const text = await resp.text();
         if (!resp.ok) {
-            throw Object.assign(new Error(`任务提交失败: ${resp.status} ${text.slice(0, 500)}`), { statusCode: resp.status });
+            // FastAPI 的 detail 就是报错文案(无效 key / 缺 model / 无效 JSON 等)
+            const text = await resp.text();
+            let message = `任务提交失败: HTTP ${resp.status}`;
+            try {
+                message = `任务提交失败: HTTP ${resp.status} ${extractUpstreamMessage(JSON.parse(text))}`.trimEnd();
+            } catch { /* 非 JSON 原样展示 */ }
+            throw taskApiError('提交任务', resp.status, message, text.slice(0, 2000), ctx);
         }
         const data = JSON.parse(text);
-        if (!data?.id) throw new Error('任务提交未返回 task_id');
+        if (!data?.id) throw taskApiError('提交任务', 502, '任务提交未返回 task_id', text.slice(0, 2000), ctx);
         return data.id;
     }));
 }
 
-async function pollTask(upstream, apiKey, taskId, after) {
+async function pollTask(upstream, apiKey, taskId, after, ctx) {
     return withNetRetry('任务轮询', () => fetch(`${upstream}/v1/openai/tasks/${encodeURIComponent(taskId)}?after=${after}`, {
         headers: { 'Authorization': `Bearer ${apiKey}` },
     }).then(async resp => {
         if (!resp.ok) {
             const text = await resp.text().catch(() => '');
-            throw Object.assign(new Error(`任务查询失败: ${resp.status} ${text.slice(0, 500)}`), { statusCode: resp.status });
+            let message = `任务查询失败: HTTP ${resp.status}`;
+            try {
+                message = `任务查询失败: HTTP ${resp.status} ${extractUpstreamMessage(JSON.parse(text))}`.trimEnd();
+            } catch { /* 非 JSON 原样展示 */ }
+            throw taskApiError('查询任务', resp.status, message, text.slice(0, 2000) || null, ctx);
         }
         return resp.json();
     }));
@@ -208,21 +343,29 @@ function shouldIntercept(generateData) {
 }
 
 /** 非流式:envelope → 伪 Response(failed 时 ok=false,ST 会弹错并透传错误体) */
-function envelopeToResponse(env) {
+function envelopeToResponse(env, ctx) {
     const status = env.status === 'failed'
         ? (env.status_code ?? 502)
         : (env.status === 'cancelled' ? 499 : 200);
-    const body = env.status === 'completed'
-        ? JSON.stringify(env.result ?? {})
-        : JSON.stringify(env.result ?? { error: { message: env.error ?? `任务 ${env.status}`, code: status } });
-    return new Response(body, {
-        status,
-        headers: { 'Content-Type': 'application/json' },
-    });
+    if (env.status === 'completed') {
+        return new Response(JSON.stringify(env.result ?? {}), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+        });
+    }
+    // failed / cancelled:构造完整错误并弹详情窗,再返回错误 Response 给 ST
+    const upstreamMsg = extractUpstreamMessage(env.result) || extractStreamError(env.chunks)?.message || env.error || '';
+    const message = env.status === 'cancelled'
+        ? '任务已取消'
+        : `上游返回错误: HTTP ${status}${upstreamMsg ? ` ${upstreamMsg}` : ''}`;
+    const detail = prettyJson(env.result).trim() || extractStreamError(env.chunks)?.raw || env.error || null;
+    const err = taskApiError(env.status === 'cancelled' ? '任务被取消' : '上游返回错误', status, message, detail, ctx);
+    showTaskErrorPopup(err);
+    return taskErrorResponse(err);
 }
 
 /** 流式:伪 SSE Response,分片推进 ReadableStream(准流式) */
-function streamTaskResponse(upstream, apiKey, taskId, signal) {
+function streamTaskResponse(upstream, apiKey, taskId, signal, ctx) {
     const encoder = new TextEncoder();
 
     const stream = new ReadableStream({
@@ -236,7 +379,7 @@ function streamTaskResponse(upstream, apiKey, taskId, signal) {
                     await new Promise(r => setTimeout(r, nextDelay));
                     if (signal?.aborted) break;
 
-                    const env = await pollTask(upstream, apiKey, taskId, after);
+                    const env = await pollTask(upstream, apiKey, taskId, after, ctx);
                     for (const chunk of (env.chunks ?? [])) {
                         controller.enqueue(encoder.encode(chunk));
                     }
@@ -244,12 +387,26 @@ function streamTaskResponse(upstream, apiKey, taskId, signal) {
 
                     if (env.done) {
                         const joined = (env.chunks ?? []).join('');
-                        // failed 且无错误帧时补一帧让 ST 弹 toast
-                        if (env.status === 'failed' && env.error && !joined.includes('"error"')) {
-                            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message: env.error, code: env.status_code ?? 502 } })}\n\n`));
-                        }
-                        if (env.status === 'cancelled' && !joined.includes('"error"')) {
-                            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message: '任务已取消', code: 499 } })}\n\n`));
+                        if (env.status === 'failed' || env.status === 'cancelled') {
+                            const status = env.status === 'cancelled' ? 499 : (env.status_code ?? 502);
+                            const parsed = extractStreamError(env.chunks);
+                            const upstreamMsg = parsed?.message || env.error || '';
+                            const message = env.status === 'cancelled'
+                                ? '任务已取消'
+                                : `上游返回错误: HTTP ${status}${upstreamMsg ? ` ${upstreamMsg}` : ''}`;
+                            // 详情弹窗(完整上游错误体)
+                            showTaskErrorPopup(taskApiError(
+                                env.status === 'cancelled' ? '任务被取消' : '上游返回错误',
+                                status,
+                                message,
+                                parsed?.raw || prettyJson(env.result).trim() || env.error || null,
+                                ctx,
+                            ));
+                            // chunks 里没有 ST 可解析的 data: {...error...} 帧时补一帧,
+                            // 让 ST 原生流式报错路径(toastr)也能给出明确文案
+                            if (!parsed) {
+                                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message, code: status } })}\n\n`));
+                            }
                         }
                         // 上游 SSE 缺 [DONE] 时补齐(ST 靠它结束流)
                         if (!joined.includes('[DONE]')) {
@@ -262,12 +419,16 @@ function streamTaskResponse(upstream, apiKey, taskId, signal) {
                 }
                 if (Date.now() >= deadline && !signal?.aborted) {
                     await cancelTask(upstream, apiKey, taskId);
-                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message: `任务 ${taskId} 超时(${POLL_MAX_MINUTES} 分钟)`, code: 504 } })}\n\n`));
+                    const message = `任务超过 ${POLL_MAX_MINUTES} 分钟未完成,已自动取消`;
+                    showTaskErrorPopup(taskApiError('轮询超时', 504, message, null, ctx));
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message, code: 504 } })}\n\n`));
                     controller.enqueue(encoder.encode('data: [DONE]\n\n'));
                 }
             } catch (err) {
                 try {
-                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message: err.message ?? String(err), code: err.statusCode ?? 502 } })}\n\n`));
+                    const taskErr = err.isTaskApiError ? err : taskApiError('轮询任务', err.statusCode ?? 502, err.message ?? String(err), null, ctx);
+                    showTaskErrorPopup(taskErr);
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message: taskErr.message, code: taskErr.statusCode } })}\n\n`));
                     controller.enqueue(encoder.encode('data: [DONE]\n\n'));
                 } catch {
                     // controller 已关闭
@@ -294,10 +455,27 @@ function streamTaskResponse(upstream, apiKey, taskId, signal) {
 /** 把 catiecli 任务跑成一个伪 Response(SSE 流或 JSON),接口与 ST 期望一致 */
 async function runTaskAsResponse(generateData, signal) {
     const upstream = resolveUpstream(generateData);
-    const apiKey = await resolveApiKey();
+    let apiKey;
+    let ctx = { model: generateData?.model ?? '', upstream };
+    try {
+        apiKey = await resolveApiKey();
+    } catch (err) {
+        const taskErr = err.isTaskApiError ? err : taskApiError('检查设置', err.statusCode ?? 401, err.message, null, ctx);
+        showTaskErrorPopup(taskErr);
+        return taskErrorResponse(taskErr);
+    }
     const requestBody = extractOpenAIBody(generateData);
+    ctx = { model: requestBody.model ?? ctx.model, upstream };
 
-    const taskId = await submitTask(upstream, apiKey, requestBody);
+    let taskId;
+    try {
+        taskId = await submitTask(upstream, apiKey, requestBody, ctx);
+    } catch (err) {
+        // 提交阶段失败:详情弹窗 + 错误 Response(不回退直连,避免用户误以为生成正常)
+        const taskErr = err.isTaskApiError ? err : taskApiError('提交任务', err.statusCode ?? 502, err.message, null, ctx);
+        showTaskErrorPopup(taskErr);
+        return taskErrorResponse(taskErr);
+    }
     console.info(`[st-catiecli-tasks] 任务已提交: ${taskId}(stream=${requestBody.stream})`);
 
     if (!requestBody.stream) {
@@ -305,22 +483,33 @@ async function runTaskAsResponse(generateData, signal) {
         const deadline = Date.now() + POLL_MAX_MINUTES * 60 * 1000;
         let after = 0;
         let env = null;
-        while (Date.now() < deadline) {
-            if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
-            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
-            env = await pollTask(upstream, apiKey, taskId, after);
-            after = env.next_after ?? after;
-            if (env.done) break;
-            env = null;
+        ctx.taskId = taskId;
+        try {
+            while (Date.now() < deadline) {
+                if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                env = await pollTask(upstream, apiKey, taskId, after, ctx);
+                after = env.next_after ?? after;
+                if (env.done) break;
+                env = null;
+            }
+        } catch (err) {
+            // 轮询阶段失败:详情弹窗 + 错误 Response(ST 原生 toast 路径可解析)
+            const taskErr = err.isTaskApiError ? err : taskApiError('轮询任务', err.statusCode ?? 502, err.message ?? String(err), null, ctx);
+            showTaskErrorPopup(taskErr);
+            return taskErrorResponse(taskErr);
         }
         if (!env) {
             await cancelTask(upstream, apiKey, taskId);
-            throw Object.assign(new Error(`任务 ${taskId} 超过 ${POLL_MAX_MINUTES} 分钟未完成`), { statusCode: 504 });
+            const err = taskApiError('轮询超时', 504, `任务超过 ${POLL_MAX_MINUTES} 分钟未完成,已自动取消`, null, ctx);
+            showTaskErrorPopup(err);
+            return taskErrorResponse(err);
         }
-        return envelopeToResponse(env);
+        return envelopeToResponse(env, ctx);
     }
 
-    return streamTaskResponse(upstream, apiKey, taskId, signal);
+    ctx.taskId = taskId;
+    return streamTaskResponse(upstream, apiKey, taskId, signal, ctx);
 }
 
 function installFetchPatch() {
@@ -329,19 +518,13 @@ function installFetchPatch() {
     window.fetch = async function (input, init) {
         const url = typeof input === 'string' ? input : input?.url ?? '';
         if (url.includes(GENERATE_URL) && init?.method?.toUpperCase() === 'POST' && init?.body) {
+            let generateData = null;
             try {
-                const generateData = JSON.parse(init.body);
-                if (shouldIntercept(generateData)) {
-                    console.info('[st-catiecli-tasks] 接管生成请求 →', generateData.model);
-                    return await runTaskAsResponse(generateData, init.signal ?? null);
-                }
-            } catch (err) {
-                if (err instanceof DOMException && err.name === 'AbortError') throw err;
-                // 拦截失败(缺密钥/JSON 问题):透传原始请求并提示
-                console.error('[st-catiecli-tasks] 接管失败,回退 ST 原生请求:', err);
-                if (typeof toastr !== 'undefined') {
-                    toastr.warning(`Catiecli Tasks 接管失败: ${err.message}`, '已回退直连模式');
-                }
+                generateData = JSON.parse(init.body);
+            } catch { /* 非 JSON 请求体,不接管 */ }
+            if (generateData && shouldIntercept(generateData)) {
+                console.info('[st-catiecli-tasks] 接管生成请求 →', generateData.model);
+                return await runTaskAsResponse(generateData, init.signal ?? null);
             }
         }
         return originalFetch.call(this, input, init);

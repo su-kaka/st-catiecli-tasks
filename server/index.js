@@ -102,6 +102,61 @@ export const info = {
     description: 'OpenAI-compatible provider backed by the Catiecli task API (submit + poll), immune to unstable long-lived connections',
 };
 
+// ===== 错误体解析（让 ST 的 toast / 弹窗能显示完整上游报错） =====
+
+/** 从上游错误体挖最可读的消息(标准 OpenAI / FastAPI detail 形态) */
+function extractUpstreamMessage(result) {
+    if (result == null) return '';
+    if (typeof result === 'string') return result.trim();
+    const err = result.error ?? result.detail;
+    if (typeof err === 'string') return err;
+    if (typeof err?.message === 'string') return err.message;
+    if (typeof result?.message === 'string') return result.message;
+    if (typeof err?.status === 'string') return err.status;
+    return '';
+}
+
+/** 从 SSE 分片里提取 data: {...} 错误帧的消息与原文 */
+function extractStreamError(chunks) {
+    const text = (Array.isArray(chunks) ? chunks : []).join('');
+    for (const line of text.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const payload = trimmed.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        try {
+            const data = JSON.parse(payload);
+            const message = extractUpstreamMessage(data);
+            if (message) return { message, raw: JSON.stringify(data, null, 2) };
+        } catch { /* 非 JSON 行,跳过 */ }
+    }
+    return null;
+}
+
+/** 任务终态 → OpenAI 错误体:优先透传上游原文,消息里带状态码与上游文案 */
+function buildTaskErrorBody(env) {
+    const status = env.status === 'cancelled' ? 499 : (env.status_code ?? 502);
+    const parsed = extractStreamError(env.chunks);
+    const upstreamMessage = extractUpstreamMessage(env.result) || parsed?.message || env.error || '';
+    const message = env.status === 'cancelled'
+        ? 'Task was cancelled'
+        : `上游返回错误: HTTP ${status}${upstreamMessage ? ` ${upstreamMessage}` : ''}`;
+    // detail:非流式用 result 原文;流式用 SSE 错误帧原文;都没有用 env.error
+    let detail = null;
+    if (typeof env.result === 'string') detail = env.result.slice(0, 4000);
+    else if (env.result != null) detail = JSON.stringify(env.result).slice(0, 4000);
+    else if (parsed?.raw) detail = parsed.raw;
+    else if (env.error) detail = env.error;
+    return { message, status, detail };
+}
+
+/** OpenAI 标准错误体:detail 有值时嵌进 error.metadata,供需要完整信息的前端展示 */
+function openAiErrorBody(message, code, detail) {
+    const error = { message, type: 'upstream_error', code };
+    if (detail) error.metadata = { upstream_response: String(detail).slice(0, 4000) };
+    return { error };
+}
+
 /**
  * 带取消信号与退避的 GET 轮询。返回 envelope 或 null（超时）。
  * @param {string} taskId
@@ -132,7 +187,11 @@ async function pollTask(taskId, after, apiKey, signal, upstream) {
             });
             if (!resp.ok) {
                 const text = await resp.text().catch(() => '');
-                throw Object.assign(new Error(`Task poll failed: ${resp.status} ${text.slice(0, 500)}`), { statusCode: resp.status });
+                let upstreamMessage = text.slice(0, 500);
+                try {
+                    upstreamMessage = extractUpstreamMessage(JSON.parse(text)) || upstreamMessage;
+                } catch { /* 非 JSON 原样 */ }
+                throw Object.assign(new Error(`任务查询失败: HTTP ${resp.status} ${upstreamMessage}`), { statusCode: resp.status });
             }
             return resp.json();
         }, signal);
@@ -167,7 +226,11 @@ async function submitTask(body, apiKey, signal, upstream) {
     }).then(async resp => {
         const text = await resp.text();
         if (!resp.ok) {
-            throw Object.assign(new Error(`Task submit failed: ${resp.status} ${text.slice(0, 1000)}`), { statusCode: resp.status });
+            let upstreamMessage = text.slice(0, 1000);
+            try {
+                upstreamMessage = extractUpstreamMessage(JSON.parse(text)) || upstreamMessage;
+            } catch { /* 非 JSON 原样 */ }
+            throw Object.assign(new Error(`任务提交失败: HTTP ${resp.status} ${upstreamMessage}`), { statusCode: resp.status });
         }
         const data = JSON.parse(text);
         if (!data?.id) throw new Error('Task submit returned no task id');
@@ -217,7 +280,7 @@ async function handleStream(req, res, body, apiKey) {
             if (abort.signal.aborted) return;
             const result = await pollTask(taskId, cursor, apiKey, abort.signal, upstream);
             if (!result) {
-                res.write(`data: ${JSON.stringify({ error: { message: `Task ${taskId} timed out after ${POLL_MAX_MINUTES} minutes`, code: 504 } })}\n\n`);
+                res.write(`data: ${JSON.stringify({ error: { message: `任务超过 ${POLL_MAX_MINUTES} 分钟未完成,已自动取消 (task ${taskId})`, code: 504 } })}\n\n`);
                 res.write('data: [DONE]\n\n');
                 return;
             }
@@ -232,24 +295,22 @@ async function handleStream(req, res, body, apiKey) {
                 if (!data.stream) {
                     // 理论上不会发生（本分支只在 stream=true 进入），防御性处理
                     res.write('data: [DONE]\n\n');
-                } else if (data.status === 'completed' || data.status === 'cancelled') {
-                    // completed：上游 SSE 已含 [DONE]；
-                    // cancelled：补一个错误帧让 ST 显示中断原因
-                    if (data.status === 'cancelled') {
-                        res.write(`data: ${JSON.stringify({ error: { message: 'Task was cancelled', code: 499 } })}\n\n`);
-                    }
+                } else if (data.status === 'completed') {
                     if (!(data.chunks || []).join('').includes('[DONE]')) {
                         res.write('data: [DONE]\n\n');
                     }
-                } else if (data.status === 'failed') {
-                    // 失败：错误体可能在 chunks 里（错误 SSE），若没有则补一帧
+                } else if (data.status === 'cancelled' || data.status === 'failed') {
+                    // 失败/取消:补一个 ST 可解析的 data: {...error...} 帧,
+                    // 消息里带状态码 + 上游文案(从错误 SSE 帧/result 里提取)
+                    const { message, status, detail } = buildTaskErrorBody(data);
                     const joined = (data.chunks || []).join('');
-                    if (!joined.includes('"error"') && data.error) {
-                        res.write(`data: ${JSON.stringify({ error: { message: data.error, code: data.status_code ?? 502 } })}\n\n`);
+                    if (!extractStreamError(data.chunks)) {
+                        res.write(`data: ${JSON.stringify(openAiErrorBody(message, status, detail))}\n\n`);
                     }
                     if (!joined.includes('[DONE]')) {
                         res.write('data: [DONE]\n\n');
                     }
+                    console.error(`[st-catiecli-tasks] task ${taskId} ${data.status}: HTTP ${status} ${message}${detail ? `\n  upstream: ${String(detail).slice(0, 500)}` : ''}`);
                 }
                 return;
             }
@@ -294,7 +355,7 @@ async function handleNonStream(req, res, body, apiKey) {
         while (true) {
             const result = await pollTask(taskId, cursor, apiKey, abort.signal, upstream);
             if (!result) {
-                return res.status(504).json({ error: { message: `Task ${taskId} timed out after ${POLL_MAX_MINUTES} minutes`, code: 504 } });
+                return res.status(504).json({ error: { message: `任务超过 ${POLL_MAX_MINUTES} 分钟未完成,已自动取消 (task ${taskId})`, code: 504 } });
             }
             data = result.data;
             cursor = result.cursor;
@@ -302,7 +363,13 @@ async function handleNonStream(req, res, body, apiKey) {
         }
 
         if (data.status === 'failed') {
-            return res.status(data.status_code ?? 502).json(data.result ?? { error: { message: data.error ?? 'Task failed', code: data.status_code ?? 502 } });
+            const { message, status, detail } = buildTaskErrorBody(data);
+            // 优先原样透传上游错误体(标准 OpenAI 形态);若上游体不可解析则用组装体
+            const upstreamBody = (data.result && typeof data.result === 'object' && data.result.error)
+                ? data.result
+                : null;
+            console.error(`[st-catiecli-tasks] task ${taskId} failed: HTTP ${status} ${message}${detail ? `\n  upstream: ${String(detail).slice(0, 500)}` : ''}`);
+            return res.status(status).json(upstreamBody ?? openAiErrorBody(message, status, detail));
         }
         if (data.status === 'cancelled') {
             return res.status(499).json({ error: { message: 'Task was cancelled', code: 499 } });

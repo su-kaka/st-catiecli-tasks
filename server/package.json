@@ -1,6 +1,6 @@
 {
     "name": "st-catiecli-tasks",
-    "version": "1.3.0",
+    "version": "1.4.0",
     "description": "Catiecli Tasks API provider for SillyTavern — exposes a standard OpenAI-compatible endpoint backed by the task (submit/poll) API, immune to unstable long-lived connections",
     "main": "index.js",
     "type": "module"
