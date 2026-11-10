@@ -113,8 +113,8 @@ async function withNetRetry(label, fn) {
     throw taskApiError(
         label,
         502,
-        `${label}失败: 连续 ${NET_RETRY_MAX} 次无法连接上游(${lastErr?.message ?? '网络错误'})。请检查网络或上游地址`,
-        lastErr?.stack ?? null,
+        `${label}失败: 连续 ${NET_RETRY_MAX} 次无法连接上游。请检查网络或上游地址`,
+        lastErr ? `${lastErr.message}\n\n${lastErr.cause?.code ? `原因代码: ${lastErr.cause.code}\n\n` : ''}${lastErr.stack ?? ''}` : null,
     );
 }
 
@@ -245,7 +245,6 @@ async function submitTask(upstream, apiKey, body, ctx) {
         const text = await resp.text();
         if (!resp.ok) {
             // FastAPI 的 detail 就是报错文案(无效 key / 缺 model / 无效 JSON 等)
-            const text = await resp.text();
             let message = `任务提交失败: HTTP ${resp.status}`;
             try {
                 message = `任务提交失败: HTTP ${resp.status} ${extractUpstreamMessage(JSON.parse(text))}`.trimEnd();
